@@ -1,0 +1,60 @@
+# Open: C:\Users\ls3412\Desktop\A2A\docker\docker-compose.yml
+services:
+  a2a_postgres:
+    image: postgres:16-alpine
+    container_name: a2a_postgres
+    environment:
+      POSTGRES_USER: a2a_user
+      POSTGRES_PASSWORD: secure_password_change_me
+      POSTGRES_DB: a2a_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - a2a_network
+
+  a2a_redis:
+    image: redis:7-alpine
+    container_name: a2a_redis
+    command: redis-server --appendonly yes --requirepass redis_secure_password_change_me
+    ports:
+      - "6385:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - a2a_network
+
+  a2a_clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: a2a_clickhouse
+    # ADD this environment section to force ClickHouse to set this password:
+    environment:
+      - CLICKHOUSE_PASSWORD=secure_password_change_me
+    ports:
+      - "8125:8123"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+    networks:
+      - a2a_network
+
+  a2a_ollama:
+    image: ollama/ollama:latest
+    container_name: a2a_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - a2a_network
+
+volumes:
+  pg_data:
+  redis_data:
+  ch_data:
+  ollama_data:
+
+networks:
+  a2a_network:
+    name: a2a_network

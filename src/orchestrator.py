@@ -1,0 +1,269 @@
+"""
+A2A Orchestrator to coordinate Redis caching, Text-to-SQL execution,
+database auditing, and structured UI Card synthesis via Qwen2:7b.
+"""
+
+import time
+import json
+import hashlib
+import decimal
+import re
+from uuid import uuid4
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+from src.card_model import Card
+from src.models import ChatHistory, ChatMessageType
+from src.skills.sql_skill import SQLSkill
+from config.cache import RedisManager
+from config.settings import get_settings
+from llama_index.core import Settings
+
+
+def serialize_decimal(obj):
+    """
+    Recursively search and convert any decimal.Decimal objects into floats 
+    to guarantee standard JSON serialization succeeds without raising TypeErrors.
+    """
+    if isinstance(obj, list):
+        return [serialize_decimal(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: serialize_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, decimal.Decimal):
+        return float(obj)
+    return obj
+
+
+class A2AOrchestrator:
+    def __init__(self):
+        self.sql_skill = SQLSkill()
+        self.settings = get_settings()
+
+    def _generate_cache_key(self, tenant_id: str, question: str) -> str:
+        """Generates a secure cache key with tenant isolation to prevent cache bleeding"""
+        raw_key = f"{tenant_id}:{question.strip().lower()}:sql_skill"
+        return f"a2a:cache:{hashlib.sha256(raw_key.encode()).hexdigest()}"
+
+    async def ask(
+        self,
+        db_session: AsyncSession,
+        text_query: str,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        agent_id: str,
+        trace_id: str = None
+    ) -> Card:
+        start_time = time.time()
+        trace_id = trace_id or str(uuid4())
+        cache_key = self._generate_cache_key(tenant_id, text_query)
+
+        # 1. Check Redis Cache for preexisting Card structures
+        try:
+            cached_data = await RedisManager.get(cache_key)
+            if cached_data:
+                card = Card.model_validate(cached_data)
+                # Cache hit: Still log the final display message to trigger frontend WebSockets
+                await self._log_to_history(
+                    db_session=db_session, 
+                    message_type=ChatMessageType.A2UI_DISPLAY,
+                    agent_id=agent_id, 
+                    tenant_id=tenant_id, 
+                    session_id=session_id, 
+                    user_id=user_id,
+                    request_payload={"text": text_query}, 
+                    response_payload=card.model_dump(),
+                    trace_id=trace_id, 
+                    latency_ms=int((time.time() - start_time) * 1000)
+                )
+                return card
+        except Exception:
+            pass
+
+        # 2. Compile, Validate, and Execute SQL Query
+        try:
+            sql_query, tables_used = await self.sql_skill.generate_and_validate_sql(text_query)
+            
+            # Log Tool Call intent
+            await self._log_to_history(
+                db_session=db_session, 
+                message_type=ChatMessageType.TOOL_CALL,
+                agent_id=agent_id, 
+                tenant_id=tenant_id, 
+                session_id=session_id, 
+                user_id=user_id,
+                request_payload={"question": text_query}, 
+                response_payload={"generated_sql": sql_query, "tables_filtered": tables_used},
+                trace_id=trace_id
+            )
+
+            # Execute query
+            raw_query_results = await self.sql_skill.execute_query(
+                async_session=db_session, 
+                sql_query=sql_query, 
+                agent_id=agent_id
+            )
+            
+            # Convert any database decimal.Decimal values to standard floats
+            query_results = serialize_decimal(raw_query_results)
+            
+            # Log raw database output rows safely
+            await self._log_to_history(
+                db_session=db_session, 
+                message_type=ChatMessageType.TOOL_RESULT,
+                agent_id=agent_id, 
+                tenant_id=tenant_id, 
+                session_id=session_id, 
+                user_id=user_id,
+                request_payload={"sql_query": sql_query}, 
+                response_payload={"rows": query_results},
+                trace_id=trace_id
+            )
+            
+            # 3. Card Synthesis via Qwen
+            card = await self._synthesize_card(text_query, query_results)
+
+        except Exception as e:
+            # Fallback Card on exception
+            card = Card(
+                title="System Apology",
+                body=f"Failed to fetch data: {str(e)}",
+                card_kind="text",
+                data_payload=[]
+            )
+            
+            # Log backend exception/error
+            await self._log_to_history(
+                db_session=db_session, 
+                message_type=ChatMessageType.SYSTEM_LOG,
+                agent_id=agent_id, 
+                tenant_id=tenant_id, 
+                session_id=session_id, 
+                user_id=user_id,
+                request_payload={"text": text_query}, 
+                response_payload={"error": str(e)},
+                trace_id=trace_id
+            )
+            return card
+
+        # 4. Cache synthesized Card
+        try:
+            await RedisManager.set(cache_key, card.model_dump(), ttl=self.settings.app.cache_ttl)
+        except Exception:
+            pass
+
+        # 5. Insert final visual output card to postgres chat_history
+        await self._log_to_history(
+            db_session=db_session, 
+            message_type=ChatMessageType.A2UI_DISPLAY,
+            agent_id=agent_id, 
+            tenant_id=tenant_id, 
+            session_id=session_id, 
+            user_id=user_id,
+            request_payload={"text": text_query}, 
+            response_payload=card.model_dump(),
+            trace_id=trace_id, 
+            latency_ms=int((time.time() - start_time) * 1000)
+        )
+
+        return card
+
+    async def _synthesize_card(self, question: str, results: list[dict], retries: int = 2) -> Card:
+        """
+        Synthesizes raw database results into a structured UI Card using Ollama (Qwen2:7b).
+        Enforces strict key-mapping to match the coworker's A2UI contract perfectly.
+        """
+        llm = Settings.llm
+        prompt = f"""
+        Translate the user question and the raw database rows into a strictly structured JSON Card.
+        
+        The coworker's A2UI system requires the `data_payload` to match specific frozen schemas depending on the `card_kind` you choose.
+        You MUST map and reshape the raw database column names (like 'store_name', 'completion_rate') into the standardized keys shown below.
+
+        User Question: {question}
+        Database Results: {json.dumps(results)}
+
+        Return only a raw JSON object matching this schema. Avoid any extra commentary:
+        {{
+            "title": "Title summing up response",
+            "body": "Plain-English summary of the answer",
+            "card_kind": "summary | metric | list | ranking | comparison | trend | alert | confirmation | text",
+            "data_payload": [],
+            "suggested_actions": ["Action string 1", "Action string 2"]
+        }}
+
+        Data Layout rules per card_kind (FOLLOW THESE STRICTLY):
+        - If card_kind is "summary" or "metric":
+          data_payload MUST be a list of: {{"label": str, "value": number, "unit": str}}
+          Example: [{{"label": "Completion rate", "value": 95.5, "unit": "%"}}]
+          (Never use original DB column names like 'store_name' or 'completion_rate' as keys!).
+
+        - If card_kind is "list":
+          data_payload MUST be a list of: {{"id": str, "title": str, "subtitle": str}}
+
+        - If card_kind is "ranking":
+          data_payload MUST be a list of: {{"name": str, "metric": number, "rank": int}}
+
+        - If card_kind is "comparison":
+          data_payload MUST be a list of: {{"entity": str, "metric": str, "value": number}}
+
+        - If card_kind is "trend":
+          data_payload MUST be a list of: {{"date": "YYYY-MM-DD", "value": number}}
+
+        - If card_kind is "alert":
+          data_payload MUST be a list of: {{"id": str, "title": str, "severity": "low|med|high"}}
+
+        - If card_kind is "confirmation":
+          data_payload MUST be a list of: {{"field": str, "value": str}}
+
+        - If card_kind is "text":
+          data_payload MUST be empty: []
+        """
+
+        for attempt in range(retries + 1):
+            try:
+                response = await llm.acomplete(prompt)
+                resp_text = response.text.strip()
+                
+                # Strip markdown block wrappers
+                resp_text = re.sub(r"^```(?:json)?", "", resp_text, flags=re.IGNORECASE)
+                resp_text = re.sub(r"```$", "", resp_text).strip()
+                
+                card_data = json.loads(resp_text)
+                return Card.model_validate(card_data)
+            except Exception as e:
+                if attempt == retries:
+                    # Final safe fallback if Qwen fails JSON constraint check twice
+                    return Card(
+                        title="Query Summary Results",
+                        body=f"Processed query rows successfully. Total records retrieved: {len(results)}",
+                        card_kind="text",
+                        data_payload=[]
+                    )
+                prompt += f"\n\nERROR on last attempt: {str(e)}. Output raw valid JSON only!"
+
+    async def _log_to_history(
+        self, db_session: AsyncSession, message_type: ChatMessageType,
+        agent_id: str, tenant_id: str, session_id: str, user_id: str,
+        request_payload: dict, response_payload: dict, trace_id: str, latency_ms: int = None
+    ):
+        """Enforces RLS safely via set_config and appends records directly to the database"""
+        await db_session.execute(
+            text("SELECT set_config('app.agent_id', :agent_id, true)"), 
+            {"agent_id": agent_id}
+        )
+        
+        history_record = ChatHistory(
+            message_type=message_type, 
+            agent_id=agent_id, 
+            tenant_id=tenant_id,
+            session_id=session_id, 
+            user_id=user_id, 
+            request_payload=request_payload,
+            response_payload=response_payload, 
+            trace_id=trace_id,
+            model_name=self.settings.llm.model, 
+            latency_ms=latency_ms
+        )
+        db_session.add(history_record)
+        await db_session.flush()
