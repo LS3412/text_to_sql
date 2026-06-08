@@ -8,7 +8,6 @@ import time
 import json
 import hashlib
 import decimal
-import re
 from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -19,6 +18,40 @@ from src.skills.sql_skill import SQLSkill
 from config.cache import RedisManager
 from config.settings import get_settings
 from llama_index.core import Settings
+from llama_index.core.program import LLMTextCompletionProgram
+from llama_index.core.output_parsers import PydanticOutputParser
+
+
+# Card synthesis prompt. PydanticOutputParser appends JSON-schema/format
+# instructions for the Card model automatically, so we only describe the
+# semantics + the per-card_kind data_payload shapes the A2UI side expects.
+_CARD_PROMPT_TMPL = """\
+Translate the user question and the raw database rows into a structured UI Card.
+
+You MUST map and reshape raw database column names (like 'store_name',
+'completion_rate') into the standardized keys shown below — never use raw DB
+column names as keys in data_payload.
+{history_block}
+User Question: {question}
+Database Results: {results}
+
+STRICT LAYOUT RULES:
+1. For a single numeric value use card_kind = "metric". Prefer a concrete kind
+   over "auto" whenever the data allows it.
+2. Always generate 2 to 3 relevant 'suggested_actions' as follow-up question
+   strings (e.g. ["Compare to Store 202", "Show active tasks"]).
+
+Data layout rules per card_kind (FOLLOW STRICTLY):
+- "summary" or "metric": data_payload is a list of {{"label": str, "value": number, "unit": str}}
+  e.g. [{{"label": "Completion rate", "value": 95.5, "unit": "%"}}]
+- "list": list of {{"id": str, "title": str, "subtitle": str}}
+- "ranking": list of {{"name": str, "metric": number, "rank": int}}
+- "comparison": list of {{"entity": str, "metric": str, "value": number}}
+- "trend": list of {{"date": "YYYY-MM-DD", "value": number}}
+- "alert": list of {{"id": str, "title": str, "severity": "low"|"med"|"high"}}
+- "confirmation": list of {{"field": str, "value": str}}
+- "text": data_payload MUST be empty: []
+"""
 
 
 def serialize_decimal(obj):
@@ -176,84 +209,43 @@ class A2AOrchestrator:
 
     async def _synthesize_card(self, question: str, results: list[dict], history: str = "", retries: int = 2) -> Card:
         """
-        Synthesizes raw database results into a structured UI Card using Ollama (Qwen2:7b).
-        Enforces strict key-mapping to match the coworker's A2UI contract perfectly.
-        `history` is recent conversation context (may be empty) used to phrase a
-        coherent follow-up answer.
+        Synthesizes raw database results into a structured UI Card using a LlamaIndex
+        structured-output program (LLMTextCompletionProgram + PydanticOutputParser),
+        which enforces the frozen `Card` Pydantic contract — including the per-
+        card_kind data_payload shapes via Card's model_validator. `history` is recent
+        conversation context (may be empty) used to phrase a coherent follow-up.
+
+        On repeated parse/validation failure (a small local model sometimes can't
+        satisfy the strict shapes), fall back to a code-built text Card — never raise.
         """
-        llm = Settings.llm
-        history_block = f"\nRecent conversation (for context only):\n{history}\n" if history else ""
-        prompt = f"""
-        Translate the user question and the raw database rows into a strictly structured JSON Card.
-
-        The coworker's A2UI system requires the `data_payload` to match specific frozen schemas depending on the `card_kind` you choose.
-        You MUST map and reshape the raw database column names (like 'store_name', 'completion_rate') into the standardized keys shown below.
-        {history_block}
-        User Question: {question}
-        Database Results: {json.dumps(results)}
-
-        Return only a raw JSON object matching this schema. Avoid any extra commentary:
-        {{
-            "title": "Title summing up response",
-            "body": "Plain-English summary of the answer",
-            "card_kind": "summary | metric | list | ranking | comparison | trend | alert | confirmation | text",
-            "data_payload": [],
-            "suggested_actions": ["Action string 1", "Action string 2"]
-        }}
-
-        STRICT LAYOUT RULES:
-        1. Never output card_kind as 'auto' if you can determine a better format. For single numeric values, always use card_kind = 'metric'.
-        2. Always generate 2 to 3 highly relevant 'suggested_actions' as follow-up question strings (e.g. ["Compare to Store 202", "Show active tasks"]) based on the context of the user question.
-
-        Data Layout rules per card_kind (FOLLOW THESE STRICTLY):
-        - If card_kind is "summary" or "metric":
-          data_payload MUST be a list of: {{"label": str, "value": number, "unit": str}}
-          Example: [{{"label": "Completion rate", "value": 95.5, "unit": "%"}}]
-          (Never use original DB column names like 'store_name' or 'completion_rate' as keys!).
-
-        - If card_kind is "list":
-          data_payload MUST be a list of: {{"id": str, "title": str, "subtitle": str}}
-
-        - If card_kind is "ranking":
-          data_payload MUST be a list of: {{"name": str, "metric": number, "rank": int}}
-
-        - If card_kind is "comparison":
-          data_payload MUST be a list of: {{"entity": str, "metric": str, "value": number}}
-
-        - If card_kind is "trend":
-          data_payload MUST be a list of: {{"date": "YYYY-MM-DD", "value": number}}
-
-        - If card_kind is "alert":
-          data_payload MUST be a list of: {{"id": str, "title": str, "severity": "low|med|high"}}
-
-        - If card_kind is "confirmation":
-          data_payload MUST be a list of: {{"field": str, "value": str}}
-
-        - If card_kind is "text":
-          data_payload MUST be empty: []
-        """
+        program = LLMTextCompletionProgram.from_defaults(
+            output_parser=PydanticOutputParser(output_cls=Card),
+            prompt_template_str=_CARD_PROMPT_TMPL,
+            llm=Settings.llm,
+            verbose=False,
+        )
+        history_block = (
+            f"\nRecent conversation (for context only):\n{history}\n" if history else ""
+        )
 
         for attempt in range(retries + 1):
             try:
-                response = await llm.acomplete(prompt)
-                resp_text = response.text.strip()
-                
-                # Strip markdown block wrappers
-                resp_text = re.sub(r"^```(?:json)?", "", resp_text, flags=re.IGNORECASE)
-                resp_text = re.sub(r"```$", "", resp_text).strip()
-                
-                card_data = json.loads(resp_text)
-                return Card.model_validate(card_data)
-            except Exception as e:
+                card = await program.acall(
+                    question=question,
+                    results=json.dumps(results),
+                    history_block=history_block,
+                )
+                # from_defaults returns the parsed Card; be defensive about type.
+                return card if isinstance(card, Card) else Card.model_validate(card)
+            except Exception:
                 if attempt == retries:
-                    # Final safe fallback if Qwen fails JSON constraint check twice
+                    # Final safe fallback if the model can't satisfy the Card schema.
                     return Card(
                         title="Query Summary Results",
                         body=f"Processed query rows successfully. Total records retrieved: {len(results)}",
                         card_kind="text",
-                        data_payload=[]
+                        data_payload=[],
                     )
-                prompt += f"\n\nERROR on last attempt: {str(e)}. Output raw valid JSON only!"
 
     async def _load_memory(
         self, db_session: AsyncSession, agent_id: str, tenant_id: str, session_id: str

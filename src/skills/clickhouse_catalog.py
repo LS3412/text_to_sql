@@ -1,17 +1,18 @@
 """
 ClickHouse metadata catalog lookup (§3.5).
 
-Queries the `table_metadata_catalog` table (created/seeded by
-scripts/init_clickhouse.py) so the LLM only ever sees the handful of tables
-relevant to a question. Falls back to the core tables if ClickHouse is
-unavailable or the catalog is empty.
+Queries the `table_metadata_catalog_agg` aggregated target of the catalog
+MATERIALIZED VIEW (created/seeded by scripts/init_clickhouse.py) so the LLM only
+ever sees the handful of tables relevant to a question — this is what keeps
+prompts small when there are thousands of tables. Falls back to the core tables
+if ClickHouse is unavailable or the catalog is empty.
 """
 
 import re
 import clickhouse_connect
 from config.settings import get_settings
 
-_FALLBACK_TABLES = ["stores", "active_tasks"]
+_FALLBACK_TABLES = ["stores", "active_tasks", "districts", "users"]
 
 
 class ClickHouseCatalog:
@@ -34,13 +35,22 @@ class ClickHouseCatalog:
             return list(_FALLBACK_TABLES)
 
         term_conditions = " OR ".join(
-            f"hasToken(lower(description), '{kw}') OR hasToken(lower(table_name), '{kw}')"
+            f"hasToken(search_text, '{kw}') OR hasToken(table_name, '{kw}')"
             for kw in keywords
         )
+        # The target is an AggregatingMergeTree, so we must merge the groupArray
+        # state (groupArrayMerge) and flatten it to one searchable string before
+        # matching. The GROUP BY collapses partially-merged parts deterministically.
         query = f"""
-            SELECT DISTINCT table_name
-            FROM table_metadata_catalog
-            WHERE db_source = 'sql' AND ({term_conditions})
+            SELECT table_name FROM (
+                SELECT
+                    table_name,
+                    arrayStringConcat(groupArrayMerge(search_tokens_state), ' ') AS search_text
+                FROM table_metadata_catalog_agg
+                WHERE db_source = 'sql'
+                GROUP BY db_source, table_name
+            )
+            WHERE {term_conditions}
             LIMIT {limit}
         """
         try:

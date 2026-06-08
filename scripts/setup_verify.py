@@ -50,7 +50,7 @@ async def check_redis() -> Tuple[bool, str]:
 
 async def check_database_schema() -> Tuple[bool, str]:
     """Check if database schema is initialized"""
-    expected = ("chat_history", "stores", "active_tasks")
+    expected = ("chat_history", "stores", "active_tasks", "districts", "users")
     try:
         DatabaseManager.init()
         async for session in DatabaseManager.get_session():
@@ -59,7 +59,7 @@ async def check_database_schema() -> Tuple[bool, str]:
                 SELECT COUNT(*) AS table_count
                 FROM information_schema.tables
                 WHERE table_schema = 'public'
-                AND table_name IN ('chat_history', 'stores', 'active_tasks')
+                AND table_name IN ('chat_history', 'stores', 'active_tasks', 'districts', 'users')
             """))
             count = result.scalar()
 
@@ -73,7 +73,7 @@ async def check_database_schema() -> Tuple[bool, str]:
 
 
 async def check_clickhouse_catalog() -> Tuple[bool, str]:
-    """Check the ClickHouse metadata catalog is created and seeded (§3.5)"""
+    """Check the ClickHouse catalog materialized view is created and populated (§3.5)"""
     try:
         import clickhouse_connect
 
@@ -84,9 +84,12 @@ async def check_clickhouse_catalog() -> Tuple[bool, str]:
             username=settings.clickhouse.user,
             password=settings.clickhouse.password,
         )
-        count = client.query("SELECT count() FROM table_metadata_catalog").result_rows[0][0]
-        if count > 0:
-            return True, f"✓ ClickHouse catalog seeded ({count} rows)"
+        # Count distinct tables aggregated by the materialized view target.
+        tables = client.query(
+            "SELECT uniqExact(table_name) FROM table_metadata_catalog_agg"
+        ).result_rows[0][0]
+        if tables > 0:
+            return True, f"✓ ClickHouse catalog MV populated ({tables} tables aggregated)"
         return False, "✗ ClickHouse catalog is empty — run scripts/init_clickhouse.py"
     except Exception as e:
         return False, f"✗ ClickHouse error: {str(e)} (run scripts/init_clickhouse.py)"

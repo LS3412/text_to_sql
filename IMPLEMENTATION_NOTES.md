@@ -8,17 +8,23 @@ a stated requirement and need the partner engineer's agreement.
 
 ## Spec deviations
 
-### 1. LlamaIndex `NLSQLTableQueryEngine` bypassed **(sign-off)** — §2 / §3.2
-The spec lists `NLSQLTableQueryEngine` as the "Required choice." The SQL Skill
-([src/skills/sql_skill.py](src/skills/sql_skill.py)) instead issues a single-shot
-prompt to the configured LLM and validates/limits the result itself.
+### 1. LlamaIndex `NLSQLTableQueryEngine` — RESOLVED (now used) — §2 / §3.2
+The SQL Skill ([src/skills/sql_skill.py](src/skills/sql_skill.py)) now uses
+`NLSQLTableQueryEngine` in **`sql_only=True`** mode: the engine GENERATES the SQL
+from reflected schema (it never executes or touches tenant rows), then we run the
+existing literal-aware validator + mandatory `LIMIT` and execute the SQL ourselves
+on the read-only, tenant-scoped (RLS) connection.
 
-- **Why:** the full engine adds schema-scanning latency that conflicts with the
-  §9.4 p95 budgets; the ClickHouse catalog already narrows the table set.
-- **Trade-off:** we lose LlamaIndex's built-in retrieval/repair. Mitigated by the
-  literal-aware validator, mandatory `LIMIT`, and the read-only/RLS execution path.
-- **Action:** confirm this is acceptable, or switch the skill back to
-  `NLSQLTableQueryEngine` (the Card contract and chat_history are unaffected).
+- **Latency:** the original concern (schema-scanning per request) is avoided —
+  schema reflection happens **once at startup** in a shared `SQLDatabase`
+  (built in [src/main.py](src/main.py) on a sync psycopg2 readonly engine). Per
+  request we build only a lightweight engine over the ClickHouse-narrowed `tables`.
+- **RLS preserved:** reflection reads the catalog only (tenant-agnostic), so no GUCs
+  are needed for generation; tenant isolation stays entirely in `execute_query`.
+- **Custom prompt:** a `text_to_sql_prompt` keeps our safety rules — notably "do NOT
+  filter by tenant_id" (the default prompt lacks this) and "no semicolon".
+- Card synthesis is also LlamaIndex-native now: `LLMTextCompletionProgram` +
+  `PydanticOutputParser` enforce the frozen `Card` (with a code-built text fallback).
 
 ### 2. `chat_history` partitioning uses a DEFAULT partition — §5.1
 The spec's model is one range partition per day, purged by `DROP TABLE`. We keep
@@ -58,6 +64,27 @@ SQL path, contracts, and caching are unaffected.
   questions hit cross-user (needed for the §9.4 cache-hit-ratio target). A
   context-dependent follow-up therefore shares the tenant-level cache by design;
   add `session_id` to the key if you need per-session disambiguation.
+
+---
+
+## A2A protocol surface (Agent2Agent)
+
+The agent is exposed over a **minimal, hand-rolled, spec-compliant** slice of the
+open A2A protocol ([src/a2a_protocol.py](src/a2a_protocol.py), mounted in
+[src/main.py](src/main.py)) — alongside, not replacing, `/api/v1/ask`:
+
+- **Discovery:** `GET /.well-known/agent-card.json` (+ legacy `/.well-known/agent.json`)
+  returns the Agent Card advertising one `text_to_sql` skill.
+- **Invocation:** `POST /a2a` is a JSON-RPC 2.0 endpoint supporting **`message/send`**.
+  It concatenates the message's text parts, runs them through the same orchestrator,
+  and returns the `Card` as a `DataPart` Artifact inside a `completed` `Task` (plus a
+  text Message = `card.body`). Unknown methods → `-32601`, bad JSON → `-32700`.
+- **Identity bridge:** A2A `message.contextId` → our `session_id`; `tenant_id` /
+  `user_id` / `agent_id` come from `message.metadata`, falling back to the configured
+  defaults. The `A2UI_DISPLAY` row is still written to `chat_history` either way, so
+  the A2UI half is unaffected by which transport the request arrived on.
+- **Out of scope (later / via `a2a-sdk`):** `message/stream` (SSE), `tasks/get` + task
+  store, push notifications, signed Agent Cards.
 
 ---
 

@@ -72,15 +72,46 @@ class ClickHouseSettings(BaseSettings):
 
 class LLMSettings(BaseSettings):
     """LLM (Language Model) configuration"""
+    # Which backend builds Settings.llm. One of: ollama | anthropic | openai.
+    # Default ollama keeps the demo fully local/offline; flip via LLM_PROVIDER.
+    provider: str = "ollama"
     api_key: str = ""
     model: str = "qwen2:7b"
+    base_url: str = "http://localhost:11434"  # only used by the ollama provider
     temperature: float = 0.7
     max_tokens: int = 2048
     timeout: int = 30
-    
+
     class Config:
         env_file = ".env"
         env_prefix = "LLM_"
+        case_sensitive = False
+
+
+class EvalSettings(BaseSettings):
+    """
+    DeepEval evaluation configuration.
+
+    The judge LLM (used by DeepEval's LLM-as-judge metrics) defaults to the SAME
+    provider/model as the agent (so evals stay offline by default). Override any of
+    these via EVAL_* to point the judge at a stronger model — recommended, since a
+    small local model is an unreliable judge. Blank values inherit from LLM_*.
+    """
+    provider: str = ""   # blank => inherit llm.provider
+    model: str = ""      # blank => inherit llm.model
+    api_key: str = ""    # blank => inherit llm.api_key
+    base_url: str = ""   # blank => inherit llm.base_url
+
+    # Identity used when the eval runner exercises the agent.
+    tenant_id: str = "tenant_a"
+    agent_id: str = "field_user_agent"
+
+    # Default pass threshold for LLM-judged metrics (0..1).
+    threshold: float = 0.7
+
+    class Config:
+        env_file = ".env"
+        env_prefix = "EVAL_"
         case_sensitive = False
 
 
@@ -107,6 +138,10 @@ class ApplicationSettings(BaseSettings):
     # per session so follow-ups like "what about yesterday?" have context.
     memory_turns: int = 5
 
+    # Public base URL advertised in the A2A Agent Card (/.well-known/agent-card.json)
+    # and used as the JSON-RPC service endpoint other agents call.
+    a2a_agent_url: str = "http://localhost:8000"
+
     class Config:
         env_file = ".env"
         env_prefix = "APP_"
@@ -120,6 +155,7 @@ class Settings(BaseSettings):
     clickhouse: ClickHouseSettings = ClickHouseSettings()  # <-- registered here!
     llm: LLMSettings = LLMSettings()
     app: ApplicationSettings = ApplicationSettings()
+    eval: EvalSettings = EvalSettings()
     
     class Config:
         env_file = ".env"

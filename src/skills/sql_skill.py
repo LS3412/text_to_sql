@@ -1,24 +1,64 @@
 """
 SQL Skill for translating natural language queries to SQL.
-Highly optimized for speed and safety, bypassing heavy LlamaIndex scanning.
 
-NOTE (spec deviation, §2/§3.2): the spec lists LlamaIndex `NLSQLTableQueryEngine`
-as the required engine. We deliberately bypass it for a single-shot prompt to cut
-latency. See IMPLEMENTATION_NOTES.md — this requires joint sign-off.
+Uses LlamaIndex's NLSQLTableQueryEngine to GENERATE the SQL (sql_only=True): the
+engine renders the schema of the catalog-selected tables into a prompt and asks
+the LLM for a SELECT — it never executes or touches tenant data. We then run our
+own fast validator + LIMIT enforcement and execute the validated SQL ourselves on
+the read-only, tenant-scoped (RLS) connection. This keeps tenant isolation in our
+hands while satisfying the "use NLSQLTableQueryEngine" requirement.
+
+Schema reflection (the expensive part) happens once at startup in a shared
+SQLDatabase (built in src/main.py and injected as `self.sql_database`); per request
+we only construct a lightweight NLSQLTableQueryEngine over the narrowed table set.
 """
 
+import asyncio
 import re
+
 from sqlalchemy import text
+
 from config.settings import get_settings
 from config.database import readonly_session
-from src.skills.clickhouse_catalog import ClickHouseCatalog
-from llama_index.core import Settings
+from src.skills.clickhouse_catalog import ClickHouseCatalog, _FALLBACK_TABLES
+
+from llama_index.core import Settings, PromptTemplate
+from llama_index.core.query_engine import NLSQLTableQueryEngine
+from llama_index.core.tools import QueryEngineTool
+
+
+# Custom text-to-SQL prompt. The default LlamaIndex prompt does not know about our
+# RLS model, so it would tell the model it *may* filter by any column — including
+# tenant_id, which the LLM would then fill with an invented value and get zero
+# rows. These rules mirror the safety guarantees the skill enforces downstream.
+_TEXT_TO_SQL_TMPL = PromptTemplate(
+    """You are a highly precise PostgreSQL translation engine.
+Given the user question, write a single safe PostgreSQL SELECT query.
+
+Only use the tables and columns described here:
+{schema}
+
+Rules:
+1. Output ONLY the raw SQL query — no explanation, no markdown fences, no commentary.
+2. Produce exactly one read-only SELECT (you may use WITH/CTEs). Never write
+   INSERT/UPDATE/DELETE/DDL and never use a semicolon.
+3. Do NOT filter by tenant_id — tenant isolation is enforced automatically by the
+   database. Never reference tenant_id in WHERE/JOIN.
+4. When filtering by store name use the name string, e.g. store_name = 'Store 118'.
+5. Always include a LIMIT clause (no more than {max_rows} rows).
+6. For "today"/"overdue"/"late" use now() against due_date / completed_at.
+
+Question: {query_str}
+SQLQuery: """
+)
 
 
 class SQLSkill:
-    def __init__(self):
+    def __init__(self, sql_database=None):
         self.settings = get_settings()
         self.catalog = ClickHouseCatalog()
+        # Shared, once-reflected SQLDatabase — injected at startup by src/main.py.
+        self.sql_database = sql_database
 
     def validate_sql_query(self, query: str) -> bool:
         """
@@ -67,66 +107,66 @@ class SQLSkill:
             return re.sub(r"\bLIMIT\s+\d+\b", f"LIMIT {max_rows}", base, count=1, flags=re.IGNORECASE)
         return base
 
+    def _build_query_engine(self, tables: list[str]) -> NLSQLTableQueryEngine:
+        """
+        Construct a per-request NLSQLTableQueryEngine over the catalog-narrowed
+        tables. Cheap: schema reflection lives in the shared SQLDatabase, so this
+        only renders the prompt for `tables`. sql_only=True => generate, don't run.
+        """
+        if self.sql_database is None:
+            raise RuntimeError(
+                "SQLSkill.sql_database is not set — build the SQLDatabase at startup."
+            )
+        # The engine formats the prompt with schema/query_str/dialect only, so fill
+        # max_rows ourselves via partial_format (leaving schema/query_str as the
+        # engine's placeholders) — otherwise formatting raises on the unknown var.
+        prompt = _TEXT_TO_SQL_TMPL.partial_format(max_rows=self.settings.app.max_result_rows)
+        return NLSQLTableQueryEngine(
+            sql_database=self.sql_database,
+            tables=tables,
+            llm=Settings.llm,
+            text_to_sql_prompt=prompt,
+            sql_only=True,
+            synthesize_response=False,
+        )
+
     async def generate_and_validate_sql(self, user_question: str, history: str = "") -> tuple[str, list[str]]:
         """
-        Performs a rapid, single-shot SQL generation via the configured LLM,
-        bypassing slow LlamaIndex engines. `history` is recent conversation
-        context (may be empty) used to resolve follow-up questions.
+        Generate SQL with NLSQLTableQueryEngine (sql_only), then validate + cap it.
+        `history` is recent conversation context (may be empty) folded into the NL
+        query so follow-up questions resolve. Returns (sql_query, tables_used).
         """
-        # Step 1: Query ClickHouse to scale down database context
+        # Step 1: ClickHouse catalog narrows the table set the LLM sees.
         relevant_tables = self.catalog.get_relevant_tables(user_question)
 
-        # Step 2: Format the schemas of selected tables into a clean prompt.
-        # tenant_id is intentionally omitted from the prompt — tenant isolation is
-        # enforced transparently by Row-Level Security, not by the generated WHERE.
-        schema_definitions = ""
-        if "stores" in relevant_tables:
-            schema_definitions += (
-                "Table: stores\n"
-                "Columns:\n"
-                " - store_id (SERIAL PRIMARY KEY)\n"
-                " - store_name (VARCHAR) - e.g. 'Store 118', 'Store 202'\n"
-                " - district_id (INTEGER)\n"
-                " - completion_rate (NUMERIC)\n\n"
-            )
-        if "active_tasks" in relevant_tables:
-            schema_definitions += (
-                "Table: active_tasks\n"
-                "Columns:\n"
-                " - task_id (SERIAL PRIMARY KEY)\n"
-                " - store_id (INTEGER, foreign key referencing stores.store_id)\n"
-                " - task_name (VARCHAR)\n"
-                " - status (VARCHAR) - e.g. 'Pending', 'In Progress', 'Completed'\n\n"
-            )
+        # Step 2: Fold recent history into the natural-language query (the query
+        # engine has no chat-memory parameter of its own).
+        nl_query = (
+            f"Prior conversation (use only to resolve references):\n{history}\n\nQuestion: {user_question}"
+            if history
+            else user_question
+        )
 
-        history_block = f"\nRecent conversation (use only to resolve references):\n{history}\n" if history else ""
+        # Step 3: Generate SQL. Run in a worker thread so any synchronous work
+        # inside the engine never blocks the event loop under load.
+        query_engine = self._build_query_engine(relevant_tables)
+        response = await asyncio.to_thread(query_engine.query, nl_query)
 
-        system_prompt = f"""
-        You are a highly precise PostgreSQL Translation Engine.
-        Convert the user question into a safe PostgreSQL SELECT query using these schemas:
+        # sql_only mode returns the SQL in metadata["sql_query"]; fall back to the
+        # response text to be robust across llama-index versions.
+        sql_query = (response.metadata or {}).get("sql_query") or str(response.response)
+        sql_query = sql_query.strip()
 
-        {schema_definitions}{history_block}
-        Rules:
-        1. Output ONLY the raw SQL query. No explanation, no markdown backticks, no commentary.
-        2. When filtering by store name, always use `store_name = 'Store 118'` (string match) instead of filtering by ID unless requested.
-        3. Do not append a semicolon at the end of the query.
-        4. Do NOT filter by tenant_id — tenant isolation is handled automatically by the database.
-        5. Always include a LIMIT clause (no more than {self.settings.app.max_result_rows} rows).
-        """
-
-        # Step 3: Run single-shot SQL generation via the globally configured LLM
-        response = await Settings.llm.acomplete(f"{system_prompt}\n\nQuestion: {user_question}\nSQL:")
-        sql_query = response.text.strip()
-
-        # Clean markdown wrappers if any
+        # Clean markdown wrappers if the model added any.
         sql_query = re.sub(r"^```(?:sql)?", "", sql_query, flags=re.IGNORECASE)
         sql_query = re.sub(r"```$", "", sql_query).strip()
 
-        # Step 4: Run lightning-fast safety validation
+        # Step 4: Fast safety validation (read-only role + RLS are the real guards;
+        # this rejects obviously unsafe output before it reaches the database).
         if not self.validate_sql_query(sql_query):
             raise PermissionError(f"Security Alert: Blocked unauthorized or unsafe SQL command: {sql_query}")
 
-        # Step 5: Enforce a row cap before the query ever reaches the database
+        # Step 5: Enforce a row cap before the query ever reaches the database.
         sql_query = self._apply_limit(sql_query)
 
         return sql_query, relevant_tables
@@ -148,3 +188,21 @@ class SQLSkill:
             result = await session.execute(text(sql_query))
             columns = result.keys()
             return [dict(zip(columns, row)) for row in result.fetchall()]
+
+    def as_query_engine_tool(self, tables: list[str] | None = None) -> QueryEngineTool:
+        """
+        Expose the SQL generator as a LlamaIndex QueryEngineTool. Not wired into a
+        ReActAgent today (SQL is the only skill), but this is the seam a future
+        multi-skill handler routes through once the MQL skill lands.
+        """
+        engine = self._build_query_engine(tables or list(_FALLBACK_TABLES))
+        return QueryEngineTool.from_defaults(
+            query_engine=engine,
+            name="text_to_sql",
+            description=(
+                "Generates and runs read-only PostgreSQL over the field-insights "
+                "tables (stores, active_tasks, districts, users) for current-state "
+                "questions about task completion, overdue/at-risk tasks, and store "
+                "or district performance."
+            ),
+        )
