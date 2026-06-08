@@ -102,16 +102,24 @@ class SQLSkill:
             
         return sql_query, relevant_tables
 
-    async def execute_query(self, async_session, sql_query: str, agent_id: str) -> list[dict]:
+    async def execute_query(self, async_session, sql_query: str, agent_id: str, tenant_id: str) -> list[dict]:
         """
         Executes a safe SELECT statement against the PostgreSQL database.
-        Enforces Row-Level Security (RLS) dynamically using set_config().
+        Enforces both Agent Isolation (RLS) and Tenant Isolation (RLS) safely.
         """
+        # 1. Set agent session identity (for chat_history table security)
         await async_session.execute(
             text("SELECT set_config('app.agent_id', :agent_id, true)"), 
             {"agent_id": agent_id}
         )
         
+        # 2. Set tenant session identity (for stores and active_tasks table security)
+        await async_session.execute(
+            text("SELECT set_config('app.tenant_id', :tenant_id, true)"), 
+            {"tenant_id": tenant_id}
+        )
+        
+        # Execute query
         result = await async_session.execute(text(sql_query))
         columns = result.keys()
         return [dict(zip(columns, row)) for row in result.fetchall()]

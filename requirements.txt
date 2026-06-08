@@ -8,4 +8,4 @@ python-json-logger>=2.0.0
 clickhouse-connect>=0.6.0
 llama-index-core>=0.10.0
 llama-index-llms-ollama>=0.1.0
-pg8000>=1.30.0
+locust>=2.15.0
