@@ -1,6 +1,7 @@
 """
 A2A Orchestrator to coordinate Redis caching, Text-to-SQL execution,
 database auditing, and structured UI Card synthesis via Qwen2:7b.
+Enforces real-time database facts mapped to strict UI contracts.
 """
 
 import time
@@ -58,12 +59,11 @@ class A2AOrchestrator:
         trace_id = trace_id or str(uuid4())
         cache_key = self._generate_cache_key(tenant_id, text_query)
 
-        # 1. Check Redis Cache for preexisting Card structures
+        # 1. STANDBY PATH: REDIS CACHING
         try:
             cached_data = await RedisManager.get(cache_key)
             if cached_data:
                 card = Card.model_validate(cached_data)
-                # Cache hit: Still log the final display message to trigger frontend WebSockets
                 await self._log_to_history(
                     db_session=db_session, 
                     message_type=ChatMessageType.A2UI_DISPLAY,
@@ -71,7 +71,7 @@ class A2AOrchestrator:
                     tenant_id=tenant_id, 
                     session_id=session_id, 
                     user_id=user_id,
-                    request_payload={"text": text_query}, 
+                    request_payload={"text": text_query, "routing": "redis_cache_hit"}, 
                     response_payload=card.model_dump(),
                     trace_id=trace_id, 
                     latency_ms=int((time.time() - start_time) * 1000)
@@ -80,7 +80,7 @@ class A2AOrchestrator:
         except Exception:
             pass
 
-        # 2. Compile, Validate, and Execute SQL Query
+        # 2. FALLBACK PATH: LIVE DYNAMIC TEXT-TO-SQL
         try:
             sql_query, tables_used = await self.sql_skill.generate_and_validate_sql(text_query)
             
@@ -120,7 +120,7 @@ class A2AOrchestrator:
                 trace_id=trace_id
             )
             
-            # 3. Card Synthesis via Qwen
+            # Card Synthesis via Qwen
             card = await self._synthesize_card(text_query, query_results)
 
         except Exception as e:
@@ -132,7 +132,6 @@ class A2AOrchestrator:
                 data_payload=[]
             )
             
-            # Log backend exception/error
             await self._log_to_history(
                 db_session=db_session, 
                 message_type=ChatMessageType.SYSTEM_LOG,
@@ -146,13 +145,13 @@ class A2AOrchestrator:
             )
             return card
 
-        # 4. Cache synthesized Card
+        # Save synthesized Card to Redis
         try:
             await RedisManager.set(cache_key, card.model_dump(), ttl=self.settings.app.cache_ttl)
         except Exception:
             pass
 
-        # 5. Insert final visual output card to postgres chat_history
+        # Insert final visual output card to postgres chat_history
         await self._log_to_history(
             db_session=db_session, 
             message_type=ChatMessageType.A2UI_DISPLAY,
@@ -160,7 +159,7 @@ class A2AOrchestrator:
             tenant_id=tenant_id, 
             session_id=session_id, 
             user_id=user_id,
-            request_payload={"text": text_query}, 
+            request_payload={"text": text_query, "routing": "live_text_to_sql"}, 
             response_payload=card.model_dump(),
             trace_id=trace_id, 
             latency_ms=int((time.time() - start_time) * 1000)
@@ -191,6 +190,10 @@ class A2AOrchestrator:
             "data_payload": [],
             "suggested_actions": ["Action string 1", "Action string 2"]
         }}
+
+        STRICT LAYOUT RULES:
+        1. Never output card_kind as 'auto' if you can determine a better format. For single numeric values, always use card_kind = 'metric'.
+        2. Always generate 2 to 3 highly relevant 'suggested_actions' as follow-up question strings (e.g. ["Compare to Store 202", "Show active tasks"]) based on the context of the user question.
 
         Data Layout rules per card_kind (FOLLOW THESE STRICTLY):
         - If card_kind is "summary" or "metric":
