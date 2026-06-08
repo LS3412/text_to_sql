@@ -82,8 +82,15 @@ class A2AOrchestrator:
 
         # 2. FALLBACK PATH: LIVE DYNAMIC TEXT-TO-SQL
         try:
-            sql_query, tables_used = await self.sql_skill.generate_and_validate_sql(text_query)
-            
+            # Load recent conversation memory for this session so follow-ups
+            # ("what about yesterday?") have context (§3.1). Best-effort: never
+            # let a memory miss break the request.
+            history = await self._load_memory(db_session, agent_id, tenant_id, session_id)
+
+            sql_query, tables_used = await self.sql_skill.generate_and_validate_sql(
+                text_query, history=history
+            )
+
             # Log Tool Call intent
             await self._log_to_history(
                 db_session=db_session, 
@@ -97,11 +104,11 @@ class A2AOrchestrator:
                 trace_id=trace_id
             )
 
-            # Execute query
+            # Execute query against the read-only, tenant-scoped connection
             raw_query_results = await self.sql_skill.execute_query(
-                async_session=db_session, 
-                sql_query=sql_query, 
-                agent_id=agent_id
+                sql_query=sql_query,
+                agent_id=agent_id,
+                tenant_id=tenant_id
             )
             
             # Convert any database decimal.Decimal values to standard floats
@@ -121,7 +128,7 @@ class A2AOrchestrator:
             )
             
             # Card Synthesis via Qwen
-            card = await self._synthesize_card(text_query, query_results)
+            card = await self._synthesize_card(text_query, query_results, history=history)
 
         except Exception as e:
             # Fallback Card on exception
@@ -167,18 +174,21 @@ class A2AOrchestrator:
 
         return card
 
-    async def _synthesize_card(self, question: str, results: list[dict], retries: int = 2) -> Card:
+    async def _synthesize_card(self, question: str, results: list[dict], history: str = "", retries: int = 2) -> Card:
         """
         Synthesizes raw database results into a structured UI Card using Ollama (Qwen2:7b).
         Enforces strict key-mapping to match the coworker's A2UI contract perfectly.
+        `history` is recent conversation context (may be empty) used to phrase a
+        coherent follow-up answer.
         """
         llm = Settings.llm
+        history_block = f"\nRecent conversation (for context only):\n{history}\n" if history else ""
         prompt = f"""
         Translate the user question and the raw database rows into a strictly structured JSON Card.
-        
+
         The coworker's A2UI system requires the `data_payload` to match specific frozen schemas depending on the `card_kind` you choose.
         You MUST map and reshape the raw database column names (like 'store_name', 'completion_rate') into the standardized keys shown below.
-
+        {history_block}
         User Question: {question}
         Database Results: {json.dumps(results)}
 
@@ -244,6 +254,49 @@ class A2AOrchestrator:
                         data_payload=[]
                     )
                 prompt += f"\n\nERROR on last attempt: {str(e)}. Output raw valid JSON only!"
+
+    async def _load_memory(
+        self, db_session: AsyncSession, agent_id: str, tenant_id: str, session_id: str
+    ) -> str:
+        """
+        Loads the last N A2UI_DISPLAY turns for this session and returns them as a
+        compact text block for the LLM. Filters tenant_id AND session_id (§7.3) and
+        sets app.agent_id so the RLS policy on chat_history is satisfied (§5.2).
+        Best-effort: returns "" on any error so memory never breaks a request.
+        """
+        try:
+            turns = self.settings.app.memory_turns
+            await db_session.execute(
+                text("SELECT set_config('app.agent_id', :v, true)"), {"v": agent_id}
+            )
+            result = await db_session.execute(
+                text(
+                    """
+                    SELECT request_payload, response_payload
+                    FROM chat_history
+                    WHERE tenant_id = :tenant_id
+                      AND session_id = :session_id
+                      AND message_type = 'A2UI_DISPLAY'
+                    ORDER BY created_at DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"tenant_id": tenant_id, "session_id": session_id, "lim": turns},
+            )
+            rows = result.fetchall()
+
+            lines = []
+            for request_payload, response_payload in reversed(rows):  # oldest first
+                req = request_payload if isinstance(request_payload, dict) else {}
+                resp = response_payload if isinstance(response_payload, dict) else {}
+                question = req.get("text")
+                answer = resp.get("body")
+                if question and answer:
+                    lines.append(f"User: {question}\nAssistant: {answer}")
+
+            return "\n".join(lines)
+        except Exception:
+            return ""
 
     async def _log_to_history(
         self, db_session: AsyncSession, message_type: ChatMessageType,

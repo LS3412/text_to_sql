@@ -8,6 +8,8 @@ import asyncio
 import sys
 from typing import Tuple
 
+from sqlalchemy import text
+
 # Import configuration
 sys.path.insert(0, '.')
 from config.settings import get_settings
@@ -20,12 +22,11 @@ async def check_database() -> Tuple[bool, str]:
     try:
         settings = get_settings()
         DatabaseManager.init()
-        
+
         # Try to get a session and run a simple query
         async for session in DatabaseManager.get_session():
-            result = await session.execute("SELECT 1")
-            await session.close()
-        
+            await session.execute(text("SELECT 1"))
+
         return True, "✓ PostgreSQL connected successfully"
     except Exception as e:
         return False, f"✗ PostgreSQL error: {str(e)}"
@@ -49,27 +50,46 @@ async def check_redis() -> Tuple[bool, str]:
 
 async def check_database_schema() -> Tuple[bool, str]:
     """Check if database schema is initialized"""
+    expected = ("chat_history", "stores", "active_tasks")
     try:
-        from sqlalchemy import text
-        
         DatabaseManager.init()
         async for session in DatabaseManager.get_session():
-            # Check if tables exist
+            # Check if the core tables exist
             result = await session.execute(text("""
-                SELECT COUNT(*) as table_count
+                SELECT COUNT(*) AS table_count
                 FROM information_schema.tables
                 WHERE table_schema = 'public'
-                AND table_name IN ('chat_history', 'sql_queries', 'database_schema_context', 'text_to_sql_metrics')
+                AND table_name IN ('chat_history', 'stores', 'active_tasks')
             """))
             count = result.scalar()
-            await session.close()
-        
-        if count == 4:
-            return True, f"✓ Database schema initialized ({count}/4 tables found)"
+
+        total = len(expected)
+        if count == total:
+            return True, f"✓ Database schema initialized ({count}/{total} tables found)"
         else:
-            return False, f"✗ Database schema incomplete ({count}/4 tables found)"
+            return False, f"✗ Database schema incomplete ({count}/{total} tables found)"
     except Exception as e:
         return False, f"✗ Schema check error: {str(e)}"
+
+
+async def check_clickhouse_catalog() -> Tuple[bool, str]:
+    """Check the ClickHouse metadata catalog is created and seeded (§3.5)"""
+    try:
+        import clickhouse_connect
+
+        settings = get_settings()
+        client = clickhouse_connect.get_client(
+            host=settings.clickhouse.host,
+            port=settings.clickhouse.port,
+            username=settings.clickhouse.user,
+            password=settings.clickhouse.password,
+        )
+        count = client.query("SELECT count() FROM table_metadata_catalog").result_rows[0][0]
+        if count > 0:
+            return True, f"✓ ClickHouse catalog seeded ({count} rows)"
+        return False, "✗ ClickHouse catalog is empty — run scripts/init_clickhouse.py"
+    except Exception as e:
+        return False, f"✗ ClickHouse error: {str(e)} (run scripts/init_clickhouse.py)"
 
 
 async def main():
@@ -105,7 +125,12 @@ async def main():
     success, message = await check_database_schema()
     print(f"   {message}")
     results.append(success)
-    
+
+    print("\n4. ClickHouse Catalog")
+    success, message = await check_clickhouse_catalog()
+    print(f"   {message}")
+    results.append(success)
+
     # Summary
     print("\n" + "="*60)
     if all(results):

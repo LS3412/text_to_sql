@@ -14,12 +14,22 @@ class DatabaseSettings(BaseSettings):
     user: str = "a2a_user"
     password: str = "secure_password_change_me"
     name: str = "a2a_db"
-    
+
+    # Read-only role used by the SQL Skill to execute LLM-generated SELECTs (§7.2).
+    # Created by database/schema.sql; subject to tenant RLS on the data tables.
+    readonly_user: str = "a2a_readonly"
+    readonly_password: str = "readonly_secure_password_change_me"
+
     @property
     def url(self) -> str:
-        """Get database URL"""
+        """Get the read/write database URL (used for audit writes to chat_history)."""
         return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
-    
+
+    @property
+    def readonly_url(self) -> str:
+        """Get the read-only database URL (used by skills to run generated SQL)."""
+        return f"postgresql+asyncpg://{self.readonly_user}:{self.readonly_password}@{self.host}:{self.port}/{self.name}"
+
     class Config:
         env_prefix = "DB_"
         env_file = ".env"
@@ -92,7 +102,11 @@ class ApplicationSettings(BaseSettings):
     # Caching
     cache_ttl: int = 3600  # 1 hour in seconds
     schema_cache_ttl: int = 86400  # 24 hours
-    
+
+    # Conversation memory (§3.1) — number of recent A2UI_DISPLAY turns to load
+    # per session so follow-ups like "what about yesterday?" have context.
+    memory_turns: int = 5
+
     class Config:
         env_file = ".env"
         env_prefix = "APP_"

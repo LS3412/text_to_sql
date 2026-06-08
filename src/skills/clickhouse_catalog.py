@@ -1,6 +1,18 @@
-# Open: C:\Users\ls3412\Desktop\A2A\src\skills\clickhouse_catalog.py
+"""
+ClickHouse metadata catalog lookup (§3.5).
+
+Queries the `table_metadata_catalog` table (created/seeded by
+scripts/init_clickhouse.py) so the LLM only ever sees the handful of tables
+relevant to a question. Falls back to the core tables if ClickHouse is
+unavailable or the catalog is empty.
+"""
+
+import re
 import clickhouse_connect
 from config.settings import get_settings
+
+_FALLBACK_TABLES = ["stores", "active_tasks"]
+
 
 class ClickHouseCatalog:
     def __init__(self):
@@ -10,24 +22,30 @@ class ClickHouseCatalog:
             host=self.settings.clickhouse.host,
             port=self.settings.clickhouse.port,
             username=self.settings.clickhouse.user,
-            password=self.settings.clickhouse.password # <-- Now correctly loads 'secure_password_change_me'
+            password=self.settings.clickhouse.password,
         )
 
     def get_relevant_tables(self, user_question: str, limit: int = 4) -> list[str]:
-        keywords = [word.lower() for word in user_question.split() if len(word) > 3]
+        # Sanitize keywords to alphanumeric tokens — hasToken() rejects tokens
+        # containing separators, and this also prevents query injection.
+        raw = (re.sub(r"[^a-z0-9]", "", word.lower()) for word in user_question.split())
+        keywords = [kw for kw in raw if len(kw) > 3]
         if not keywords:
-            return ["stores", "active_tasks"]
-            
-        term_conditions = " OR ".join([f"hasToken(lower(description), '{kw}') OR hasToken(lower(table_name), '{kw}')" for kw in keywords])
+            return list(_FALLBACK_TABLES)
+
+        term_conditions = " OR ".join(
+            f"hasToken(lower(description), '{kw}') OR hasToken(lower(table_name), '{kw}')"
+            for kw in keywords
+        )
         query = f"""
             SELECT DISTINCT table_name
             FROM table_metadata_catalog
-            WHERE db_source = 'postgres' AND ({term_conditions})
+            WHERE db_source = 'sql' AND ({term_conditions})
             LIMIT {limit}
         """
         try:
             result = self.client.query(query)
             tables = [row[0] for row in result.result_rows]
-            return tables if tables else ["stores", "active_tasks"]
+            return tables if tables else list(_FALLBACK_TABLES)
         except Exception:
-            return ["stores", "active_tasks"]
+            return list(_FALLBACK_TABLES)
