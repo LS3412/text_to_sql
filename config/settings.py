@@ -14,22 +14,22 @@ class DatabaseSettings(BaseSettings):
     user: str = "a2a_user"
     password: str = "secure_password_change_me"
     name: str = "a2a_db"
-
+    
     # Read-only role used by the SQL Skill to execute LLM-generated SELECTs (§7.2).
     # Created by database/schema.sql; subject to tenant RLS on the data tables.
     readonly_user: str = "a2a_readonly"
     readonly_password: str = "readonly_secure_password_change_me"
-
+    
     @property
     def url(self) -> str:
         """Get the read/write database URL (used for audit writes to chat_history)."""
         return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
-
+        
     @property
     def readonly_url(self) -> str:
         """Get the read-only database URL (used by skills to run generated SQL)."""
         return f"postgresql+asyncpg://{self.readonly_user}:{self.readonly_password}@{self.host}:{self.port}/{self.name}"
-
+        
     class Config:
         env_prefix = "DB_"
         env_file = ".env"
@@ -49,14 +49,13 @@ class RedisSettings(BaseSettings):
         if self.password:
             return f"redis://:{self.password}@{self.host}:{self.port}/{self.db}"
         return f"redis://{self.host}:{self.port}/{self.db}"
-    
+        
     class Config:
         env_prefix = "REDIS_"
         env_file = ".env"
         case_sensitive = False
 
 
-# ADD ClickHouse configuration class
 class ClickHouseSettings(BaseSettings):
     """ClickHouse configuration"""
     host: str = "localhost"
@@ -72,6 +71,8 @@ class ClickHouseSettings(BaseSettings):
 
 class LLMSettings(BaseSettings):
     """LLM (Language Model) configuration"""
+    provider: str = "ollama"
+    base_url: str = "http://localhost:11434"
     api_key: str = ""
     model: str = "qwen2:7b"
     temperature: float = 0.7
@@ -102,14 +103,33 @@ class ApplicationSettings(BaseSettings):
     # Caching
     cache_ttl: int = 3600  # 1 hour in seconds
     schema_cache_ttl: int = 86400  # 24 hours
-
-    # Conversation memory (§3.1) — number of recent A2UI_DISPLAY turns to load
-    # per session so follow-ups like "what about yesterday?" have context.
+    
+    # Conversation memory turns
     memory_turns: int = 5
-
+    a2a_agent_url: str = "http://localhost:8000"
+    
     class Config:
         env_file = ".env"
         env_prefix = "APP_"
+        case_sensitive = False
+
+
+class EvalSettings(BaseSettings):
+    """Evaluation configuration"""
+    tenant_id: str = "tenant_a"
+    agent_id: str = "field_user_agent"
+    threshold: float = 0.7
+    
+    # FIXED: Allow optional None types cleanly to bypass strict string validation errors
+    provider: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    timeout: int | None = None
+    
+    class Config:
+        env_file = ".env"
+        env_prefix = "EVAL_"
         case_sensitive = False
 
 
@@ -117,9 +137,10 @@ class Settings(BaseSettings):
     """Main settings class combining all configs"""
     database: DatabaseSettings = DatabaseSettings()
     redis: RedisSettings = RedisSettings()
-    clickhouse: ClickHouseSettings = ClickHouseSettings()  # <-- registered here!
+    clickhouse: ClickHouseSettings = ClickHouseSettings()
     llm: LLMSettings = LLMSettings()
     app: ApplicationSettings = ApplicationSettings()
+    eval: EvalSettings = EvalSettings()
     
     class Config:
         env_file = ".env"
@@ -130,6 +151,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Get cached settings instance.
-    Use this function to access settings throughout the application.
     """
     return Settings()

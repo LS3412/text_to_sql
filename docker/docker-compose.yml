@@ -45,7 +45,7 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      - ollama_data:/root/.ollama
+      - /c/Users/ls3412/.ollama:/root/.ollama
     networks:
       - a2a_network
 
@@ -53,7 +53,6 @@ volumes:
   pg_data:
   redis_data:
   ch_data:
-  ollama_data:
 
 networks:
   a2a_network:

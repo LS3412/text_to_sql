@@ -1,10 +1,16 @@
-from uuid import uuid4
+"""
+Main FastAPI server for the Text-to-SQL A2A application.
+Implements the A2A JSON-RPC 2.0 interface alongside standard REST endpoints.
+Uses pure-Python pg8000 dialect for secure, zero-binary schema reflection.
+"""
 
+from uuid import uuid4
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
+
 from llama_index.core import Settings, SQLDatabase
 from llama_index.core.embeddings import MockEmbedding
 
@@ -51,7 +57,8 @@ app = FastAPI(title="Workcloud A2A Text-to-SQL API", version="1.0.0")
 AGENT_CARD = build_agent_card(settings)
 
 # Tables the LlamaIndex SQLDatabase reflects (chat_history is intentionally excluded).
-_REFLECT_TABLES = ["stores", "active_tasks", "districts", "users"]
+# Restricted strictly to existing tables to prevent startup exceptions
+_REFLECT_TABLES = ["stores", "active_tasks"]
 
 
 class AskRequest(BaseModel):
@@ -65,12 +72,14 @@ class AskRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     await RedisManager.init()
-
+    
     # Build the shared SQLDatabase ONCE here (DB must be live). NLSQLTableQueryEngine
     # only generates SQL (sql_only) so it needs schema reflection, not tenant data —
     # reflection reads the catalog and is unaffected by RLS. Use a SYNC engine
     # (SQLDatabase/SQLAlchemy reflection is sync) on the least-privilege readonly role.
-    sync_url = settings.database.readonly_url.replace("+asyncpg", "+psycopg2")
+    # Swap out binary psycopg2 with pure-Python pg8000 for Windows-safe runtime
+    sync_url = settings.database.readonly_url.replace("+asyncpg", "+pg8000")
+    
     sync_engine = create_engine(sync_url, poolclass=NullPool)
     sql_database = SQLDatabase(sync_engine, include_tables=_REFLECT_TABLES)
     orchestrator.sql_skill.sql_database = sql_database
@@ -107,6 +116,7 @@ async def ask_endpoint(
 # --------------------------------------------------------------------------- #
 # A2A protocol surface (augments /api/v1/ask; wraps the same orchestrator)
 # --------------------------------------------------------------------------- #
+
 @app.get("/.well-known/agent-card.json")
 async def agent_card():
     """A2A discovery: the Agent Card describing this agent's skills + endpoint."""
@@ -131,23 +141,22 @@ async def a2a_endpoint(request: Request, db: AsyncSession = Depends(get_db_sessi
         body = await request.json()
     except Exception:
         return JSONResponse(jsonrpc_error(None, PARSE_ERROR, "Parse error: invalid JSON"))
-
+        
     req_id = body.get("id") if isinstance(body, dict) else None
-
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
         return JSONResponse(jsonrpc_error(req_id, INVALID_REQUEST, "Invalid JSON-RPC 2.0 request"))
-
+        
     method = body.get("method")
     if method != "message/send":
         return JSONResponse(
             jsonrpc_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
         )
-
+        
     params = body.get("params") or {}
     message = params.get("message") if isinstance(params, dict) else None
     if not isinstance(message, dict):
         return JSONResponse(jsonrpc_error(req_id, INVALID_PARAMS, "params.message is required"))
-
+        
     # Concatenate the text of all text parts into the natural-language question.
     parts = message.get("parts") or []
     text_query = " ".join(
@@ -155,11 +164,12 @@ async def a2a_endpoint(request: Request, db: AsyncSession = Depends(get_db_sessi
         for p in parts
         if isinstance(p, dict) and p.get("kind") == "text"
     ).strip()
+    
     if not text_query:
         return JSONResponse(
             jsonrpc_error(req_id, INVALID_PARAMS, "message has no text part to answer")
         )
-
+        
     # Identity bridge: A2A contextId -> our session_id; tenant/user/agent come from
     # message.metadata, falling back to configured defaults.
     meta = message.get("metadata") or {}
@@ -167,7 +177,7 @@ async def a2a_endpoint(request: Request, db: AsyncSession = Depends(get_db_sessi
     tenant_id = meta.get("tenant_id", settings.app.default_tenant_id)
     user_id = meta.get("user_id", "a2a_user")
     agent_id = meta.get("agent_id", settings.app.default_agent_id)
-
+    
     try:
         card = await orchestrator.ask(
             db_session=db,
@@ -182,7 +192,7 @@ async def a2a_endpoint(request: Request, db: AsyncSession = Depends(get_db_sessi
         return JSONResponse(
             jsonrpc_error(req_id, INTERNAL_ERROR, f"Agent execution failed: {e}")
         )
-
+        
     task_id = str(uuid4())
     task = Task(
         id=task_id,
