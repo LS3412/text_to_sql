@@ -5,10 +5,7 @@ Fully compliant with Tenant-scoped Row Level Security (RLS) and strict Pydantic 
 """
 
 import time
-import json
 import hashlib
-import decimal
-import re
 from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -16,23 +13,12 @@ from sqlalchemy import text
 from src.card_model import Card
 from src.models import ChatHistory, ChatMessageType
 from src.skills.sql_skill import SQLSkill
+from src.pipeline.pipeline import Pipeline
+from src.pipeline.contracts import PipelineContext
+# Re-exported so the eval harness (evals/runner.py) keeps importing it from here.
+from src.pipeline.stage11_response import serialize_decimal  # noqa: F401
 from config.cache import RedisManager
 from config.settings import get_settings
-from llama_index.core import Settings
-
-
-def serialize_decimal(obj):
-    """
-    Recursively search and convert any decimal.Decimal objects into floats 
-    to guarantee standard JSON serialization succeeds without raising TypeErrors.
-    """
-    if isinstance(obj, list):
-        return [serialize_decimal(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {k: serialize_decimal(v) for k, v in obj.items()}
-    elif isinstance(obj, decimal.Decimal):
-        return float(obj)
-    return obj
 
 
 # ==========================================
@@ -249,6 +235,9 @@ class A2AOrchestrator:
     def __init__(self):
         self.sql_skill = SQLSkill()
         self.settings = get_settings()
+        # The dynamic text-to-SQL path is delegated to the modular 11-stage pipeline.
+        # main.py injects the dedicated low-temperature SQL LLM via pipeline.set_sql_llm().
+        self.pipeline = Pipeline(self.sql_skill, self.settings)
 
     def _generate_cache_key(self, tenant_id: str, question: str) -> str:
         """Generates a secure cache key with tenant isolation to prevent cache bleeding"""
@@ -320,186 +309,89 @@ class A2AOrchestrator:
         except Exception:
             pass
 
-        # 3. FALLBACK PATH: DYNAMIC TEXT-TO-SQL
+        # 3. DYNAMIC PATH: modular 11-stage pipeline (router -> retrieval -> linking ->
+        #    [generate -> validate -> transpile -> execute] correction loop -> response).
+        ctx = PipelineContext(
+            question=text_query,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            user_id=user_id,
+            trace_id=trace_id,
+        )
         try:
-            # Query Clickhouse to scale down database context
-            relevant_tables = self.sql_skill.catalog.get_relevant_tables(text_query)
-            
-            schema_definitions = ""
-            if "stores" in relevant_tables:
-                schema_definitions += (
-                    "Table: stores\n"
-                    "Columns:\n"
-                    " - store_id (SERIAL PRIMARY KEY)\n"
-                    " - store_name (VARCHAR) - e.g. 'Store 118', 'Store 202'\n"
-                    " - district_id (INTEGER)\n"
-                    " - completion_rate (NUMERIC)\n\n"
-                )
-            if "active_tasks" in relevant_tables:
-                schema_definitions += (
-                    "Table: active_tasks\n"
-                    "Columns:\n"
-                    " - task_id (SERIAL PRIMARY KEY)\n"
-                    " - store_id (INTEGER, foreign key referencing stores.store_id)\n"
-                    " - task_name (VARCHAR)\n"
-                    " - status (VARCHAR) - e.g. 'Pending', 'In Progress', 'Completed'\n\n"
-                )
-
-            system_prompt = f"""
-            You are a highly precise PostgreSQL Translation & Card synthesis engine.
-            Based on the schemas provided, compile the PostgreSQL query AND generate a structured card template in a single JSON response.
-
-            Schemas:
-            {schema_definitions}
-
-            Return ONLY a raw JSON object with this exact keys. Do not include markdown backticks or commentary:
-            {{
-                "sql": "The compiled SELECT SQL query (Do not append semicolon, use store_name = 'Store 118' for name filters)",
-                "title": "A summary card title",
-                "body_template": "A brief plain-English text template. Use '{{value}}' as a placeholder where the database result rate or count will be inserted (e.g. 'Store 118 is at {{value}}% completion.')",
-                "card_kind": "metric | list | summary | ranking",
-                "metric_label": "The label to display next to the value (e.g. 'Completion rate')",
-                "metric_unit": "The unit of the value (e.g. '%', 'tasks', or '')",
-                "suggested_actions": ["Action string 1", "Action string 2"]
-            }}
-            """
-
-            # Single LLM Call using global LlamaIndex Qwen setting
-            response = await Settings.llm.acomplete(f"{system_prompt}\n\nQuestion: {text_query}\nJSON Output:")
-            resp_text = response.text.strip()
-            
-            # Clean markdown wrappers
-            resp_text = re.sub(r"^```(?:json)?", "", resp_text, flags=re.IGNORECASE)
-            resp_text = re.sub(r"```$", "", resp_text).strip()
-            
-            parsed_template = json.loads(resp_text)
-            sql_query = parsed_template["sql"]
-
-            # Log Tool Call intent
-            await self._log_to_history(
-                db_session=db_session, 
-                message_type=ChatMessageType.TOOL_CALL,
-                agent_id=agent_id, 
-                tenant_id=tenant_id, 
-                session_id=session_id, 
-                user_id=user_id,
-                request_payload={"question": text_query}, 
-                response_payload={"generated_sql": sql_query, "tables_filtered": relevant_tables},
-                trace_id=trace_id
-            )
-
-            # Safety validate the compiled query (runs in 0ms)
-            if not self.sql_skill.validate_sql_query(sql_query):
-                raise PermissionError(f"Security Alert: Blocked unauthorized or unsafe SQL command: {sql_query}")
-
-            # Execute query on Postgres (takes 1ms)
-            raw_query_results = await self.sql_skill.execute_query(
-                async_session=db_session, 
-                sql_query=sql_query, 
-                agent_id=agent_id,
-                tenant_id=tenant_id # Pass tenant id to set app.tenant_id RLS
-            )
-            query_results = serialize_decimal(raw_query_results)
-            
-            # Log raw database results safely
-            await self._log_to_history(
-                db_session=db_session, 
-                message_type=ChatMessageType.TOOL_RESULT,
-                agent_id=agent_id, 
-                tenant_id=tenant_id, 
-                session_id=session_id, 
-                user_id=user_id,
-                request_payload={"sql_query": sql_query}, 
-                response_payload={"rows": query_results},
-                trace_id=trace_id
-            )
-
-            # --------------------------------------------
-            # INSTANT PYTHON-BASED CARD DATA-BINDING (0ms!)
-            # --------------------------------------------
-            db_value = 0.0
-            data_payload = []
-            
-            if query_results:
-                first_row = query_results[0]
-                
-                # SMART EXTRACTOR: Find the first numeric column in results
-                numeric_key = None
-                for k, v in first_row.items():
-                    if isinstance(v, (int, float, decimal.Decimal)):
-                        numeric_key = k
-                        break
-                
-                # Fallback to the first column if no numeric column is found
-                target_key = numeric_key if numeric_key else list(first_row.keys())[0]
-                db_value = first_row[target_key]
-                
-                # Reshape payload dynamically to match coworker's strict schemas
-                if parsed_template["card_kind"] in ["metric", "summary"]:
-                    data_payload = [{
-                        "label": parsed_template.get("metric_label", "Value"),
-                        "value": db_value,
-                        "unit": parsed_template.get("metric_unit", "")
-                    }]
-                elif parsed_template["card_kind"] == "list":
-                    # Format multiple tasks as standard ID list cards
-                    data_payload = []
-                    for i, row in enumerate(query_results):
-                        data_payload.append({
-                            "id": str(i + 1),
-                            "title": str(row.get("task_name", list(row.values())[0])),
-                            "subtitle": f"Status: {row.get('status', 'Active')}"
-                        })
-
-            # Format the body text safely using Python formatting
-            body_text = parsed_template["body_template"].replace("{value}", str(db_value))
-
-            card = Card(
-                title=parsed_template["title"],
-                body=body_text,
-                card_kind=parsed_template["card_kind"],
-                data_payload=data_payload,
-                suggested_actions=parsed_template.get("suggested_actions", [])
-            )
-
+            card, trace = await self.pipeline.run(ctx)
         except Exception as e:
+            # Final safety net: any unrecovered pipeline failure becomes a graceful card.
             card = Card(
                 title="System Apology",
                 body=f"Failed to compile details: {str(e)}",
                 card_kind="text",
-                data_payload=[]
+                data_payload=[],
             )
             await self._log_to_history(
-                db_session=db_session, 
+                db_session=db_session,
                 message_type=ChatMessageType.SYSTEM_LOG,
-                agent_id=agent_id, 
-                tenant_id=tenant_id, 
-                session_id=session_id, 
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                session_id=session_id,
                 user_id=user_id,
-                request_payload={"text": text_query}, 
+                request_payload={"text": text_query},
                 response_payload={"error": str(e)},
-                trace_id=trace_id
+                trace_id=trace_id,
             )
             return card
 
-        # Save synthesized Card to Redis
-        try:
-            await RedisManager.set(cache_key, card.model_dump(), ttl=self.settings.app.cache_ttl)
-        except Exception:
-            pass
+        routing = trace.get("routing", "pipeline")
 
-        # Insert final visual output card to postgres chat_history
+        # Audit the tool call + raw results for the successful dynamic SQL path.
+        if routing == "pipeline":
+            await self._log_to_history(
+                db_session=db_session,
+                message_type=ChatMessageType.TOOL_CALL,
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                request_payload={"question": text_query},
+                response_payload={
+                    "generated_sql": trace.get("final_sql"),
+                    "tables_filtered": trace.get("tables"),
+                    "retrieval_mode": trace.get("retrieval_mode"),
+                    "attempts": trace.get("attempts"),
+                },
+                trace_id=trace_id,
+            )
+            await self._log_to_history(
+                db_session=db_session,
+                message_type=ChatMessageType.TOOL_RESULT,
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                request_payload={"sql_query": trace.get("final_sql")},
+                response_payload={"rows": trace.get("rows", [])},
+                trace_id=trace_id,
+            )
+
+            # Cache successful dynamic answers (NOT out-of-scope redirects).
+            try:
+                await RedisManager.set(cache_key, card.model_dump(), ttl=self.settings.app.cache_ttl)
+            except Exception:
+                pass
+
+        # Insert final visual output card to postgres chat_history.
         await self._log_to_history(
-            db_session=db_session, 
+            db_session=db_session,
             message_type=ChatMessageType.A2UI_DISPLAY,
-            agent_id=agent_id, 
-            tenant_id=tenant_id, 
-            session_id=session_id, 
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            session_id=session_id,
             user_id=user_id,
-            request_payload={"text": text_query, "routing": "single_call_data_binding"}, 
+            request_payload={"text": text_query, "routing": routing},
             response_payload=card.model_dump(),
-            trace_id=trace_id, 
-            latency_ms=int((time.time() - start_time) * 1000)
+            trace_id=trace_id,
+            latency_ms=int((time.time() - start_time) * 1000),
         )
 
         return card

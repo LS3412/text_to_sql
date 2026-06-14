@@ -24,6 +24,7 @@ def build_llm_from(llm: LLMSettings):
             model=llm.model,
             base_url=llm.base_url,
             request_timeout=float(llm.timeout),
+            temperature=llm.temperature,
         )
 
     if provider == "anthropic":
@@ -35,6 +36,7 @@ def build_llm_from(llm: LLMSettings):
             api_key=llm.api_key or None,
             timeout=float(llm.timeout),
             max_tokens=llm.max_tokens,
+            temperature=llm.temperature,
         )
 
     if provider == "openai":
@@ -45,6 +47,7 @@ def build_llm_from(llm: LLMSettings):
             model=llm.model,
             api_key=llm.api_key or None,
             timeout=float(llm.timeout),
+            temperature=llm.temperature,
         )
 
     raise ValueError(
@@ -55,3 +58,14 @@ def build_llm_from(llm: LLMSettings):
 def build_llm(settings: Settings):
     """Return the agent's LLM (built from settings.llm)."""
     return build_llm_from(settings.llm)
+
+
+def build_sql_llm(settings: Settings):
+    """Return a dedicated low-temperature LLM for deterministic SQL generation (stage 5).
+
+    Reuses the configured provider but overrides the temperature with
+    ``settings.llm.sql_temperature`` (default 0.0) so SQL generation does not inherit the
+    conversational default temperature.
+    """
+    low_temp = settings.llm.model_copy(update={"temperature": settings.llm.sql_temperature})
+    return build_llm_from(low_temp)

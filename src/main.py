@@ -14,10 +14,10 @@ from sqlalchemy.pool import NullPool
 from llama_index.core import Settings, SQLDatabase
 from llama_index.core.embeddings import MockEmbedding
 
-from config.database import get_db_session
+from config.database import DatabaseManager, get_db_session
 from config.logging_config import setup_logging
 from config.cache import RedisManager
-from config.llm import build_llm
+from config.llm import build_llm, build_sql_llm
 from config.settings import get_settings
 from src.card_model import Card  # IMPORT your Card model
 from src.orchestrator import A2AOrchestrator
@@ -51,6 +51,12 @@ Settings.llm = build_llm(settings)
 Settings.embed_model = MockEmbedding(embed_dim=1536)
 
 orchestrator = A2AOrchestrator()
+
+# Inject the dedicated low-temperature SQL LLM (stage 5) into the pipeline. The RAG embed
+# model is built separately inside the pipeline (it must NOT replace the global MockEmbedding,
+# which the LlamaIndex NLSQL internals rely on).
+orchestrator.pipeline.set_sql_llm(build_sql_llm(settings))
+
 app = FastAPI(title="Workcloud A2A Text-to-SQL API", version="1.0.0")
 
 # Built once — the Agent Card is static for the process lifetime.
@@ -72,7 +78,11 @@ class AskRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     await RedisManager.init()
-    
+
+    # Eagerly initialise the read-only engine so the stage-9 executor's first request does
+    # not pay lazy-init cost and connection failures surface predictably at startup.
+    DatabaseManager.init_readonly()
+
     # Build the shared SQLDatabase ONCE here (DB must be live). NLSQLTableQueryEngine
     # only generates SQL (sql_only) so it needs schema reflection, not tenant data —
     # reflection reads the catalog and is unaffected by RLS. Use a SYNC engine

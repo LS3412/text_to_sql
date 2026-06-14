@@ -170,6 +170,11 @@ INSERT INTO active_tasks (store_id, task_name, status, tenant_id) VALUES
 -- via SELECT set_config('app.tenant_id', <tenant>, true). missing_ok=true keeps
 -- the policy from erroring when the GUC is unset (it simply returns no rows).
 -- ==========================================
+-- IMPORTANT: the stage-9 Execution Engine runs LLM-generated SELECTs as a2a_readonly.
+-- Any NEW in-scope data table added to config/semantic/dictionary.yaml must also be
+-- granted here, otherwise queries against it fail at execution (caught by the
+-- correction/apology path, not a crash). e.g.:
+--   GRANT SELECT ON <new_table> TO a2a_readonly;
 GRANT SELECT ON stores, active_tasks TO a2a_readonly;
 
 ALTER TABLE stores ENABLE ROW LEVEL SECURITY;

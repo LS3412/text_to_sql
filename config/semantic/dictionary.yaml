@@ -1,0 +1,132 @@
+# =============================================================================
+# Semantic Layer — Data Dictionary (single source of truth)
+#
+# This file is the ONLY place schema knowledge is hand-authored. It projects into:
+#   * the ClickHouse table_metadata_catalog (via scripts/init_clickhouse.py)
+#   * the pgvector schema_embeddings index (via scripts/index_schema_embeddings.py)
+#
+# To add a table so it scales to 50+ tables: append a block under `tables:`.
+# Downstream retrieval/linking operate on DESCRIPTIONS, not raw identifiers, so the
+# table/column names themselves never need to be "query-friendly".
+#
+# NOTE: tenant_id is intentionally NOT listed as a column — row-level security handles
+# tenant isolation and the LLM must never filter by it.
+# =============================================================================
+
+version: 1
+
+# Pluggable database profiles. `executor: null` means dialect/catalog target only
+# (not yet executable) — execution stays on Postgres per the locked decision.
+profiles:
+  postgres:
+    dialect: postgres
+    db_source: sql
+    executor: postgres
+    default: true
+  alloydb:
+    dialect: postgres
+    db_source: sql
+    executor: postgres
+  clickhouse:
+    dialect: clickhouse
+    db_source: clickhouse
+    executor: null
+
+# Rules injected into every generation prompt.
+global_business_rules:
+  - "Generate a single read-only SELECT (or WITH ... SELECT) query only."
+  - "Do NOT filter by tenant_id; row-level security isolates tenants automatically."
+  - "Do not append a trailing semicolon."
+
+tables:
+  - name: stores
+    db_source: sql
+    description: "Retail stores and their overall audit task completion performance."
+    synonyms: [store, stores, shop, location, branch, outlet]
+    business_rules:
+      - "When filtering by store name, use store_name = 'Store 118' (string match), not the numeric id, unless an id is explicitly requested."
+    columns:
+      - name: store_id
+        type: integer
+        description: "Unique identifier of the physical store"
+        synonyms: ["store id"]
+        example_values: ["1", "2", "3"]
+        is_filterable: true
+        is_metric: false
+      - name: store_name
+        type: varchar
+        description: "The name of the retail store"
+        synonyms: ["store name", "name"]
+        example_values: ["Store 118", "Store 202"]
+        value_map:
+          "store 118": "Store 118"
+          "118": "Store 118"
+          "store 202": "Store 202"
+          "202": "Store 202"
+        is_filterable: true
+        is_metric: false
+      - name: district_id
+        type: integer
+        description: "ID of the regional district"
+        synonyms: [district, region]
+        example_values: ["1", "2", "3"]
+        is_filterable: true
+        is_metric: false
+      - name: completion_rate
+        type: numeric
+        description: "Overall audit task completion percentage of the store"
+        synonyms: [completion, "completion rate", performance, "completion percentage"]
+        example_values: ["95.50", "82.10"]
+        is_filterable: true
+        is_metric: true
+    joins:
+      - to_table: active_tasks
+        on_left: store_id
+        on_right: store_id
+        kind: left
+
+  - name: active_tasks
+    db_source: sql
+    description: "Audit tasks assigned to stores, including their current completion status."
+    synonyms: [task, tasks, "active task", "active tasks", audit, todo, work, assignment]
+    business_rules: []
+    columns:
+      - name: task_id
+        type: integer
+        description: "Unique task identifier"
+        synonyms: ["task id"]
+        example_values: ["1", "2", "3"]
+        is_filterable: true
+        is_metric: false
+      - name: store_id
+        type: integer
+        description: "ID of the store this audit task belongs to"
+        synonyms: ["store id"]
+        example_values: ["1", "2"]
+        is_filterable: true
+        is_metric: false
+      - name: task_name
+        type: varchar
+        description: "The name or description of the audit task"
+        synonyms: ["task name", "name"]
+        example_values: ["Audit Inventory", "Restock Items"]
+        is_filterable: true
+        is_metric: false
+      - name: status
+        type: varchar
+        description: "Current completion status of the audit task"
+        synonyms: [status, state, progress]
+        example_values: ["Pending", "In Progress", "Completed"]
+        value_map:
+          "pending": "Pending"
+          "in progress": "In Progress"
+          "completed": "Completed"
+          "done": "Completed"
+          "finished": "Completed"
+        is_filterable: true
+        is_metric: false
+    joins:
+      - to_table: stores
+        on_left: store_id
+        on_right: store_id
+        kind: left
